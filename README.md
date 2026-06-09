@@ -22,6 +22,7 @@ tail -f *-*.out        # follow the log
 | `dolfinx.sh` | `dolfinx/2026` | `mpirun` / `srun --mpi=pmi2` | Conda MPICH env |
 | `reaktoro.sh` | `reaktoro/2026` | (serial) | One task, no MPI |
 | `dolfinx-reaktoro.sh` | `dolfinx-reaktoro/2026` | `mpirun` / `srun --mpi=pmi2` | For scripts using BOTH libraries |
+| `phreeqcrm.sh` | `phreeqcrm/3.9.0` + `openmpi/5.0.10` | `srun --mpi=pmix` | Runs YOUR solver that links libPhreeqcRM |
 
 ## The one thing to get right: the MPI launcher
 
@@ -32,6 +33,10 @@ The toolchains use two different MPI implementations, so they need different lau
   `mpirun -n N …` or `srun --mpi=pmi2`. **Never `--mpi=pmix` for these** — it will fail.
 
 Each template already uses the correct one; this table is just so you know why they differ.
+
+**PhreeqcRM is a library, not a program.** `phreeqcrm.sh` runs *your own solver* that links
+`libPhreeqcRM` — replace `./my_solver` with your executable. It was built serial/OpenMP (no internal
+MPI), so your solver owns the MPI (system OpenMPI → `srun --mpi=pmix`) and calls PhreeqcRM per-rank.
 
 ## Things common to every template
 
