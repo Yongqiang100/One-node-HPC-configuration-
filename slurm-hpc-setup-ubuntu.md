@@ -11,7 +11,7 @@ This builds **one workstation** that acts as both the Slurm **controller** and t
 - **NVIDIA GPU support** via Slurm GRES (Step 14)
 - **Remote access for the team** via SSH + VPN (Step 15)
 - Optional: **accounting + fairshare**, **scaling to more nodes**
-- Worked **application examples** — **PFLOTRAN**, **MOOSE**, and **OpenFOAM** (built against your MPI) and **DOLFINx + Reaktoro** (shared conda-env modules)
+- Worked **application examples** — **PFLOTRAN**, **MOOSE**, and **OpenFOAM** (built against your MPI), **DOLFINx + Reaktoro** (shared conda-env modules), and **PhreeqcRM** (a C/C++ library to link into your own solver)
 
 It's intentionally laid out so you can add real compute nodes later with minimal changes.
 
@@ -1534,6 +1534,167 @@ case data (mesh, time directories) into the working dir.
 
 ---
 
+## Application example — PhreeqcRM (a library to link, not a program to run)
+
+[PhreeqcRM](https://github.com/usgs-coupled/phreeqcrm) is the USGS reaction module for
+reactive-transport simulators — the PHREEQC geochemistry engine packaged as a C/C++/Fortran library
+you **link into your own transport solver**, not a standalone executable. This example builds it as a
+**serial/OpenMP C/C++ shared library** for the common coupling pattern where *your solver* does the
+MPI and calls PhreeqcRM per-rank on each rank's local cells. (PhreeqcRM can also do its own internal
+MPI partitioning; if you need that, build with the MPI compilers and the version's MPI CMake option
+instead — see the note at the end.)
+
+### 1. Clone from GitHub and pick a tagged release
+
+The official USGS download page lags the GitHub dev repo; GitHub has newer tags. Clone and check out
+the newest version tag:
+
+```bash
+mkdir -p /opt/sw/phreeqcrm && cd /opt/sw/phreeqcrm
+git clone https://github.com/usgs-coupled/phreeqcrm.git src
+cd src
+git tag | tail              # newest tag, e.g. v3.9.0
+git checkout v3.9.0
+git submodule update --init --recursive   # no-op if self-contained (3.9.0 is)
+```
+
+### 2. Configure (plain compilers — no MPI for the per-rank pattern)
+
+With PhreeqcRM's own MPI off, it has no MPI calls to link, so build it with plain `gcc`/`g++` — it
+then has **no OpenMPI dependency at all** (your solver brings the MPI). OpenMP is auto-detected and
+left on for optional per-rank threading.
+
+```bash
+module purge                # no openmpi module needed for this build
+SRC=/opt/sw/phreeqcrm/src
+PREFIX=/opt/sw/phreeqcrm/3.9.0
+
+cmake -S "$SRC" -B "$SRC/_build" \
+  -DCMAKE_INSTALL_PREFIX="$PREFIX" \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_C_COMPILER=gcc \
+  -DCMAKE_CXX_COMPILER=g++ \
+  -DBUILD_SHARED_LIBS=ON \
+  -DCMAKE_C_FLAGS="-O3 -march=znver4" \
+  -DCMAKE_CXX_FLAGS="-O3 -march=znver4"
+```
+
+A clean configure shows **no** "Manually-specified variables were not used" warning. (If you pass MPI
+or Fortran flags the version doesn't recognize, that warning is how it tells you — drop the flags or
+find the right names with `grep -rin "mpi\|fortran" "$SRC/CMakeLists.txt" | grep -i option`.)
+
+### 3. Build and install
+
+```bash
+cmake --build "$SRC/_build" --config Release -j 48
+cmake --install "$SRC/_build" --config Release
+```
+
+Confirm the layout (the names matter — see the gotcha below):
+
+```bash
+find "$PREFIX" -name 'libPhreeqcRM*'          # → lib/libPhreeqcRM.so  (capital P,R,M!)
+find "$PREFIX" -name 'PhreeqcRM.h'            # → include/PhreeqcRM.h
+find "$PREFIX" -name '*.dat' | head           # → share/doc/PhreeqcRM/database/phreeqc.dat, ...
+ldd "$PREFIX/lib/libPhreeqcRM.so" | grep -i mpi || echo "no MPI deps (correct)"
+```
+
+> **The library is `libPhreeqcRM.so` — capitalized — so the link flag is `-lPhreeqcRM`, not
+> `-lphreeqcrm`.** The bundled `phreeqcrm.pc` confirms it (`Libs: -lPhreeqcRM`). The databases install
+> under `share/doc/PhreeqcRM/database/` (phreeqc.dat, pitzer.dat, llnl.dat, minteq.v4.dat, …).
+
+### 4. Modulefile (a library module — sets compile/link discovery vars)
+
+No `depends_on("openmpi")` — this serial build is standalone. The module sets the variables a
+downstream compile/link needs (`CPATH`, `LIBRARY_PATH`, `LD_LIBRARY_PATH`, `CMAKE_PREFIX_PATH`,
+`PKG_CONFIG_PATH`) plus a convenience `PHREEQCRM_DATABASE`:
+
+```bash
+sudo mkdir -p /opt/modulefiles/phreeqcrm
+
+sudo tee /opt/modulefiles/phreeqcrm/3.9.0.lua > /dev/null << 'EOF'
+-- -*- lua -*-
+whatis("Name: PhreeqcRM 3.9.0 (USGS, GitHub) — serial/OpenMP C/C++ library")
+help([[ PhreeqcRM reaction-module library (C/C++), serial (no internal MPI).
+  Link with -lPhreeqcRM (capital P,R,M). Header: PhreeqcRM.h.
+  Databases in $PHREEQCRM_DATABASE (phreeqc.dat, pitzer.dat, llnl.dat, ...).
+  Coupling pattern: your solver does MPI; PhreeqcRM runs serial per rank.
+  Build flags via pkg-config:  pkg-config --cflags --libs phreeqcrm ]])
+local root = "/opt/sw/phreeqcrm/3.9.0"
+setenv("PHREEQCRM_DIR", root)
+setenv("PHREEQCRM_DATABASE", pathJoin(root, "share/doc/PhreeqcRM/database"))
+prepend_path("CMAKE_PREFIX_PATH", root)
+prepend_path("CPATH",            pathJoin(root, "include"))
+prepend_path("LIBRARY_PATH",     pathJoin(root, "lib"))
+prepend_path("LD_LIBRARY_PATH",  pathJoin(root, "lib"))
+prepend_path("PKG_CONFIG_PATH",  pathJoin(root, "lib/pkgconfig"))
+EOF
+```
+
+### 5. Verify with a link-and-run smoke test
+
+Because the bundled examples split `main()` (in `Tests/main.cpp`) from the worker routines, a single
+example file won't link alone. A 6-line standalone program is the cleanest proof the module works —
+it tests header discovery, linking, runtime loading, and that the library initializes and reads a
+database:
+
+```bash
+module purge && module load phreeqcrm/3.9.0
+cd /tmp
+cat > rm_smoke.cpp << 'CPP'
+#include "PhreeqcRM.h"
+#include <iostream>
+int main() {
+    PhreeqcRM rm(4, 1);                          // 4 cells, 1 thread, no MPI
+    IRM_RESULT s = rm.LoadDatabase("phreeqc.dat");
+    std::cout << "LoadDatabase result: " << s << " (0=OK)\n";
+    return (s == IRM_OK) ? 0 : 1;
+}
+CPP
+g++ -O3 -fopenmp rm_smoke.cpp -lPhreeqcRM -o rm_smoke   # CPATH/LIBRARY_PATH from the module
+cp "$PHREEQCRM_DATABASE/phreeqc.dat" .
+./rm_smoke                                              # → LoadDatabase result: 0 (0=OK)
+```
+
+`result: 0` and exit code 0 means PhreeqcRM is ready. Note no `-I`/`-L` flags were needed — the
+module's `CPATH`/`LIBRARY_PATH` supply them; in a Makefile you'd typically use
+`pkg-config --cflags --libs phreeqcrm` or add `-I$PHREEQCRM_DIR/include -L$PHREEQCRM_DIR/lib`
+explicitly.
+
+**Running a real bundled example.** To exercise a full reactive-transport calculation, compile one of
+the `Tests/` example *functions* with your own one-line `main` (their `main.cpp` is a multi-test
+dispatcher that won't link standalone, and globbing `Tests/*.cpp` collides on multiple `main`s — so
+wrap just the one function you want):
+
+```bash
+module purge && module load phreeqcrm/3.9.0
+cd /tmp
+cat > run_simpleadvect.cpp << 'CPP'
+void SimpleAdvect_cpp();                       // defined in SimpleAdvect_cpp.cpp
+int main() { SimpleAdvect_cpp(); return 0; }
+CPP
+g++ -O3 -fopenmp run_simpleadvect.cpp \
+  /opt/sw/phreeqcrm/src/Tests/SimpleAdvect_cpp.cpp \
+  -lPhreeqcRM -o simpleadvect
+cp "$PHREEQCRM_DATABASE/phreeqc.dat" .          # example reads files by relative name
+cp /opt/sw/phreeqcrm/src/Tests/advect.pqi .
+./simpleadvect
+```
+
+A correct run prints a 10-day transport/reaction loop (`Beginning transport calculation` /
+`Beginning reaction calculation` per step, with OpenMP `Cells shifted between threads` and load-balance
+lines) and exits cleanly — a genuine coupled geochemical-transport simulation, not just a link test.
+The same pattern works for the other example functions (`Advect_cpp`, `Species_cpp`, `Gas_cpp`, …):
+declare the one you want and give it a `main`.
+
+> **Need PhreeqcRM's own MPI** (one instance partitioning cells across ranks) instead of the per-rank
+> pattern? Rebuild against your Spack OpenMPI: `module load openmpi/5.0.10`, configure with
+> `-DCMAKE_CXX_COMPILER=mpicxx -DCMAKE_C_COMPILER=mpicc` plus the version's MPI option (find it via the
+> `grep` in step 2), and add `depends_on("openmpi/5.0.10")` to the modulefile. Then check
+> `ldd libPhreeqcRM.so | grep mpi` resolves into `/opt/spack/…` as the other MPI apps do.
+
+---
+
 ## Shared software layout (`/opt/sw`) — team access
 
 Because the apps above build into the shared `/opt/sw` tree (not anyone's home), making them available
@@ -1572,7 +1733,8 @@ Spack stack — no duplicate/ghost entries:
 
 ```bash
 module avail                  # expect: moose/dev, pflotran/6.0, openfoam/v2506,
-                              #         dolfinx/2026, reaktoro/2026, dolfinx-reaktoro/2026, openmpi/…, etc.
+                              #         dolfinx/2026, reaktoro/2026, dolfinx-reaktoro/2026,
+                              #         phreeqcrm/3.9.0, openmpi/…, etc.
 module purge && module load pflotran/6.0 && which pflotran      # → /opt/sw/pflotran/src/pflotran/pflotran
 module purge && module load moose/dev   && which combined-opt   # → /opt/sw/moose/modules/combined/combined-opt
 ```
