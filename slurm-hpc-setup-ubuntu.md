@@ -11,7 +11,7 @@ This builds **one workstation** that acts as both the Slurm **controller** and t
 - **NVIDIA GPU support** via Slurm GRES (Step 14)
 - **Remote access for the team** via SSH + VPN (Step 15)
 - Optional: **accounting + fairshare**, **scaling to more nodes**
-- Worked **application examples** — **PFLOTRAN**, **MOOSE**, and **OpenFOAM** (built against your MPI), **DOLFINx + Reaktoro** (shared conda-env modules), and **PhreeqcRM** (a C/C++ library to link into your own solver)
+- Worked **application examples** — **PFLOTRAN**, **MOOSE**, and **OpenFOAM** (built against your MPI), **DOLFINx + Reaktoro** (shared conda-env modules), **PhreeqcRM** (a C/C++ library to link into your own solver), and **dfnWorks** (discrete fracture networks coupled to PFLOTRAN)
 
 It's intentionally laid out so you can add real compute nodes later with minimal changes.
 
@@ -1692,6 +1692,152 @@ declare the one you want and give it a `main`.
 > `-DCMAKE_CXX_COMPILER=mpicxx -DCMAKE_C_COMPILER=mpicc` plus the version's MPI option (find it via the
 > `grep` in step 2), and add `depends_on("openmpi/5.0.10")` to the modulefile. Then check
 > `ldd libPhreeqcRM.so | grep mpi` resolves into `/opt/spack/…` as the other MPI apps do.
+
+---
+
+## Application: dfnWorks (discrete fracture networks → PFLOTRAN)
+
+dfnWorks (LANL) generates 3D discrete fracture networks, meshes them with **LaGriT**, solves flow with
+**PFLOTRAN**, and tracks transport with **DFNTrans** — driven by the **pydfnworks** Python package. It
+reuses the PFLOTRAN and PETSc already built in `/opt/sw` (it just needs their paths), so you only build
+the new pieces: LaGriT, DFNGen, DFNTrans, and the Python package.
+
+**The whole story here is GCC 15 strictness.** dfnWorks' components are older C/C++/Fortran, and
+Ubuntu 26.04's GCC 15 turns what used to be warnings into hard errors. Each component builds fine once
+you relax the right diagnostics. The recipe below is the same one that works for most legacy scientific
+codes on this OS — keep it handy.
+
+### 1. Prerequisites (already present)
+
+`cmake build-essential gfortran git` (from Step 1), plus the existing `/opt/sw/petsc` and
+`/opt/sw/pflotran`. Nothing new to install system-wide.
+
+### 2. Build LaGriT (the mesher) — the hardest component
+
+```bash
+mkdir -p /opt/sw/dfnworks && cd /opt/sw/dfnworks
+git clone https://github.com/lanl/LaGriT.git
+cd LaGriT && mkdir build && cd build
+
+cmake .. -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_C_FLAGS="-w -fcommon -std=gnu17 -Wno-error=implicit-int -Wno-error=implicit-function-declaration -Wno-error=incompatible-pointer-types -Wno-error=int-conversion -Wno-error=return-mismatch" \
+  -DCMAKE_Fortran_FLAGS="-w -fallow-argument-mismatch -fallow-invalid-boz -std=legacy"
+
+make -j8
+echo "finish" | ./lagrit          # smoke test: prints banner, "LaGriT successfully completed"
+```
+
+> **Why each flag.** `-std=gnu17` is the critical one: GCC 15 defaults to C23, where an empty `()` in a
+> declaration means "no arguments", breaking K&R-style code that calls those functions with arguments
+> (you'll see *"too many arguments to function"*). `gnu17` restores the old meaning. The `-Wno-error=…`
+> flags downgrade GCC-14/15 hard errors (implicit-int, incompatible-pointer-types, int-conversion,
+> return-mismatch) back to warnings. `-fcommon` allows old multiple-definition behavior. On the Fortran
+> side, `-std=legacy -fallow-argument-mismatch` does the equivalent. LaGriT progresses through three
+> distinct error classes as you add these; the full set above gets it to 100%.
+
+### 3. Clone dfnWorks; build DFNGen and DFNTrans
+
+```bash
+cd /opt/sw/dfnworks
+git clone https://github.com/lanl/dfnWorks.git
+cd dfnWorks
+
+# DFNGen — C++ fracture generator (Makefile honours CXXFLAGS override)
+cd DFNGen
+make CXXFLAGS="-std=gnu++17 -O3 -lm -w -fpermissive"
+ls -l DFNGen                       # → executable
+cd ..
+
+# DFNTrans — C particle-tracking transport
+cd DFNTrans
+make CFLAGS="-lm -O3 -w -std=gnu17 -fcommon -Wno-error=implicit-int -Wno-error=implicit-function-declaration -Wno-error=incompatible-pointer-types -Wno-error=int-conversion -Wno-error=return-mismatch"
+ls -l DFNTrans                     # → executable
+cd ..
+```
+
+> `-fpermissive -std=gnu++17` is the C++ analogue of the C relaxations — it downgrades C++ conformance
+> errors and avoids C++20/23 defaults that break the older code. DFNGen and DFNTrans each build in one
+> pass with these.
+
+### 4. pydfnworks (Python package) in a shared conda env
+
+```bash
+conda create -p /opt/sw/conda/envs/dfnworks -c conda-forge -y \
+  python=3.11 numpy h5py scipy matplotlib networkx mplstereonet fpdf2 pyvista vtk
+
+conda activate /opt/sw/conda/envs/dfnworks
+cd /opt/sw/dfnworks/dfnWorks/pydfnworks
+pip install .                      # NON-editable — copies into site-packages
+cd /tmp && python -c "import pydfnworks; print('OK')"   # must work from OUTSIDE the source dir
+```
+
+> **Use `pip install .`, not `pip install -e .`.** The editable install can appear to work only because
+> you're sitting in the source directory (Python finds the local `pydfnworks/` subfolder), then fails
+> from anywhere else — which breaks Slurm jobs that run from `~/runs/...`. The test that matters is
+> importing from `/tmp`. A plain `pip install .` copies it into the env's site-packages so it imports
+> from any directory.
+
+### 5. Modulefile
+
+```bash
+sudo mkdir -p /opt/modulefiles/dfnworks
+sudo tee /opt/modulefiles/dfnworks/2.7.lua > /dev/null << 'EOF'
+-- -*- lua -*-
+whatis("Name: dfnWorks 2.7 — DFN suite (LaGriT + DFNGen + DFNTrans + pydfnworks), coupled to PFLOTRAN")
+help([[ Run as a Slurm job (see dfnworks.sh). Activate the conda env for pydfnworks:
+  source /opt/miniforge3/etc/profile.d/conda.sh; conda activate /opt/sw/conda/envs/dfnworks
+  NOTE: use ncpu=1 in driver.py for small nets — the parallel LaGriT merge can hang. ]])
+family("pyenv")
+depends_on("openmpi/5.0.10")
+local root = "/opt/sw/dfnworks"
+local env  = "/opt/sw/conda/envs/dfnworks"
+setenv("dfnworks_PATH", root .. "/dfnWorks/")
+setenv("PETSC_DIR", "/opt/sw/petsc")
+setenv("PETSC_ARCH", "arch-linux-c-opt")
+setenv("PFLOTRAN_EXE", "/opt/sw/pflotran/src/pflotran/pflotran")
+setenv("LAGRIT_EXE", root .. "/LaGriT/build/lagrit")
+setenv("DFNGEN_EXE", root .. "/dfnWorks/DFNGen/DFNGen")
+setenv("DFNTRANS_EXE", root .. "/dfnWorks/DFNTrans/DFNTrans")
+setenv("PYTHON_EXE", env .. "/bin/python")
+prepend_path("PATH", env .. "/bin")
+prepend_path("PATH", root .. "/LaGriT/build")
+prepend_path("PATH", root .. "/dfnWorks/DFNGen")
+prepend_path("PATH", root .. "/dfnWorks/DFNTrans")
+prepend_path("LD_LIBRARY_PATH", env .. "/lib")
+EOF
+
+chmod -R o+rX /opt/sw/dfnworks /opt/sw/conda/envs/dfnworks
+module purge && module --ignore_cache load dfnworks/2.7    # --ignore_cache picks up the new file
+module list                                                # shows dfnworks/2.7 + openmpi/5.0.10
+```
+
+### 6. Verify end-to-end (the real test)
+
+```bash
+mkdir -p ~/runs && cd ~/runs
+cp -r /opt/sw/dfnworks/dfnWorks/examples/4_user_rects .
+cd 4_user_rects
+sed -i 's/ncpu=4/ncpu=1/' driver.py     # serial merge (see caveat below)
+# submit via Slurm (see the dfnworks.sh template), then watch:
+sbatch dfnworks.sh && tail -f dfnworks-*.out
+```
+
+A successful run shows: DFNGen network generation → LaGriT meshing + merge → **`mpirun -np 1
+.../pflotran -pflotranin dfn_explicit.in` → "Running PFLOTRAN Complete"** → DFNTrans → VTK output. That
+PFLOTRAN line is the proof dfnWorks is driving the shared `/opt/sw` PFLOTRAN.
+
+> **Two operational caveats, both important:**
+> 1. **Use `ncpu=1` for small/moderate networks.** The *parallel* LaGriT merge (`ncpu>1`) can spin in a
+>    busy-loop and hang on small problems in this build (you'll see `lagrit … merge_part_N` processes
+>    pegged at ~96% CPU forever). Serial merge finishes in seconds and is reliable. Only raise `ncpu`
+>    for genuinely large networks, and verify it completes. (If large-network parallel meshing is ever
+>    needed, try rebuilding LaGriT at `-O2` instead of `-O3` — aggressive optimization can change loop
+>    behaviour in the old Fortran.)
+> 2. **Run through Slurm, not interactively.** dfnWorks' pipeline wants real cores, and interactive CPU
+>    is capped per user (see the interactive-limits section). In the batch script, **activate the conda
+>    env** (`conda activate /opt/sw/conda/envs/dfnworks`) — don't just call the env's python binary, or
+>    `import pydfnworks` fails. And do **not** wrap `python driver.py` in `srun`: dfnWorks calls
+>    `mpirun` internally to launch PFLOTRAN.
 
 ---
 
