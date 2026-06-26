@@ -824,68 +824,176 @@ person's GPU and CPU use is scheduled and bounded — the whole reason Slurm is 
 
 ---
 
-## Optional A — Accounting + fairshare (recommended for a shared box)
+## Optional A — Accounting + job history (and optional fairshare)
 
-This tracks usage and enables **fairshare** so a single user can't monopolize the machine.
+This gives you a persistent, queryable **job history** — who ran what, when, for how long, with what
+CPU and memory — via `sacct` and `sreport`. It's the `slurmdbd` accounting daemon writing job records
+into a **MariaDB** database. The same database is also the prerequisite for fairshare and per-user
+limits later, so set it up once even if you only want history now.
+
+There are two levels: a weak flat-file mode (`accounting_storage/filetxt`) and the real thing
+(`slurmdbd` + MariaDB). Use the real thing — it's the standard and barely more work.
+
+### A.1 Install MariaDB and slurmdbd
 
 ```bash
-sudo apt install -y slurmdbd mariadb-server
+sudo apt update
+sudo apt install -y mariadb-server slurmdbd
 sudo systemctl enable --now mariadb
 ```
 
-Create the database and a slurm DB user:
+### A.2 Create the accounting database and DB user
+
+Choose a password and use the **same** string here and in `slurmdbd.conf` (A.3). It's a localhost-only
+DB account, but keep it out of shell history / shared notes.
 
 ```bash
-sudo mysql <<'SQL'
+sudo mysql << 'SQL'
 CREATE DATABASE IF NOT EXISTS slurm_acct_db;
-CREATE USER IF NOT EXISTS 'slurm'@'localhost' IDENTIFIED BY 'CHANGE_ME';
-GRANT ALL ON slurm_acct_db.* TO 'slurm'@'localhost';
+CREATE USER IF NOT EXISTS 'slurm'@'localhost' IDENTIFIED BY '<DB_PASSWORD>';
+GRANT ALL PRIVILEGES ON slurm_acct_db.* TO 'slurm'@'localhost';
 FLUSH PRIVILEGES;
 SQL
 ```
 
-Write `/etc/slurm/slurmdbd.conf` (must be `chmod 600`, owned by `slurm`):
+> **Gotcha #1 — the password must match.** The single most common failure is creating the DB user with
+> one password and writing a different one into `slurmdbd.conf`. slurmdbd then loops forever with
+> `error: mysql_real_connect failed: 1045 Access denied for user 'slurm'@'localhost'` and never opens
+> its port (so slurmctld/sacctmgr get *"Connection refused"* on 6819). If you hit this, fix the DB side
+> to match the conf and restart slurmdbd:
+> ```bash
+> sudo mysql -e "ALTER USER 'slurm'@'localhost' IDENTIFIED BY '<DB_PASSWORD>'; FLUSH PRIVILEGES;"
+> sudo systemctl restart slurmdbd
+> ```
 
-```ini
-# /etc/slurm/slurmdbd.conf
-AuthType=auth/munge
+### A.3 Configure slurmdbd
+
+```bash
+sudo tee /etc/slurm/slurmdbd.conf > /dev/null << 'EOF'
 DbdHost=localhost
-StorageType=accounting_storage/mysql
-StorageHost=localhost
-StorageUser=slurm
-StoragePass=CHANGE_ME
-StorageLoc=slurm_acct_db
+DbdPort=6819
 SlurmUser=slurm
+DebugLevel=info
 LogFile=/var/log/slurm/slurmdbd.log
 PidFile=/run/slurmdbd.pid
-```
 
-```bash
+StorageType=accounting_storage/mysql
+StorageHost=localhost
+StoragePort=3306
+StorageUser=slurm
+StoragePass=<DB_PASSWORD>
+StorageLoc=slurm_acct_db
+EOF
+
+# slurmdbd.conf holds the DB password — it MUST be 0600 and slurm-owned,
+# or slurmdbd refuses to start.
 sudo chown slurm:slurm /etc/slurm/slurmdbd.conf
 sudo chmod 600 /etc/slurm/slurmdbd.conf
+sudo mkdir -p /var/log/slurm && sudo chown slurm:slurm /var/log/slurm
+
 sudo systemctl enable --now slurmdbd
+sudo tail -5 /var/log/slurm/slurmdbd.log     # should show a clean MySQL connect, no "Access denied"
+sudo ss -tlnp | grep 6819                     # slurmdbd LISTENing = healthy
 ```
 
-Add to `/etc/slurm/slurm.conf`, then restart and register the cluster:
+### A.4 Point slurm.conf at slurmdbd
 
-```ini
-AccountingStorageType=accounting_storage/slurmdbd
-AccountingStorageHost=localhost
-# Enable fairshare:
-PriorityType=priority/multifactor
-PriorityWeightFairshare=100000
-```
+Edit **`/etc/slurm/slurm.conf`** and add the accounting lines. `ClusterName` is already set near the
+top of the file from Step 5 — note its value (e.g. `hpc`) and do **not** add a second one.
 
 ```bash
+sudo tee -a /etc/slurm/slurm.conf > /dev/null << 'EOF'
+
+# --- Accounting (slurmdbd + MariaDB) ---
+AccountingStorageType=accounting_storage/slurmdbd
+AccountingStorageHost=localhost
+AccountingStoragePort=6819
+JobAcctGatherType=jobacct_gather/cgroup
+JobAcctGatherFrequency=30
+EOF
+
 sudo systemctl restart slurmctld
-sudo sacctmgr -i add cluster hpc
-sudo sacctmgr -i add account researchers
-sudo sacctmgr -i add user alice account=researchers
-sacct                    # usage records now populate
+scontrol show config | grep -i accountingstoragetype    # → accounting_storage/slurmdbd
 ```
 
-(If you added the GPU in Step 14, also set `AccountingStorageTRES=gres/gpu` so GPU-hours are
-tracked.)
+> **Gotcha #2 — edit the file, don't paste into the shell.** The accounting lines must go *into*
+> `slurm.conf`. Typing them at the bash prompt just runs them as (failing) commands and changes
+> nothing — the symptom is `sacctmgr` reporting *"You are not running a supported accounting_storage
+> plugin"* because slurmctld never picked up the config. Use the `tee -a` above (or a real editor) and
+> confirm with the `scontrol show config` check.
+>
+> `JobAcctGatherType=jobacct_gather/cgroup` is what captures per-job **memory** (`MaxRSS`); without it
+> you get timing and CPU but no memory high-water mark.
+
+### A.5 Register the cluster, account, and users
+
+The cluster name here **must exactly match `ClusterName` in slurm.conf** (here `hpc`). A mismatch makes
+slurmctld unable to store records.
+
+```bash
+sudo sacctmgr -i add cluster hpc
+sudo sacctmgr -i add account researchers Description="Research group" Organization=lab
+sudo sacctmgr -i add user thmc    account=researchers
+sudo sacctmgr -i add user chen    account=researchers
+sudo sacctmgr -i add user calo    account=researchers
+sudo sacctmgr -i add user hussain account=researchers
+
+sacctmgr show associations format=Cluster,Account,User    # verify the mapping
+```
+
+### A.6 Verify end-to-end
+
+```bash
+sbatch --wrap='sleep 20; echo done' --job-name=acct-test
+# after it runs (give it time if the node is busy):
+sacct -X --format=JobID,JobName,User,State,Elapsed,AllocCPUS,Start,End
+sacct -j <jobid> --format=JobID,JobName,MaxRSS,Elapsed,State    # MaxRSS shows on the .batch step
+```
+
+A job appearing as `COMPLETED` with elapsed time and timestamps means accounting is live and recording.
+
+### A.7 Querying the job history (day to day)
+
+```bash
+# sacct — job records
+sacct -X -S today                                            # today (one line per job)
+sacct -X -S 2026-06-01 -E now                                # a date range
+sacct -u calo --format=JobID,JobName,Elapsed,MaxRSS,State    # one user
+sacct -j 1234                                                # one job (step detail incl. MaxRSS)
+
+# sreport — aggregate usage
+sreport cluster utilization start=2026-06-01 end=now         # node utilization
+sreport user top start=2026-06-01 end=now TopCount=10        # top users by usage
+sreport cluster AccountUtilizationByUser start=2026-06-01 end=now
+```
+
+`-X` collapses the per-step `.batch`/`.extern` rows into one line per job; drop it for step-level
+detail (where `MaxRSS` lives).
+
+### What is and isn't captured
+
+- **Only Slurm jobs are accounted.** Interactive work run outside the scheduler (a bare `python` or
+  `mpirun` on the shell) never appears in `sacct`/`sreport`. This is inherent to Slurm accounting — and
+  a further reason to push heavy work through `sbatch`: queued jobs get recorded and attributed;
+  interactive work is invisible to history and reporting.
+- Records persist indefinitely by default; the DB grows slowly on one node. `sacctmgr archive` exists
+  if you ever want to prune.
+
+### Optional — turn on fairshare / limits later
+
+Accounting as set up above is **record-only** (`AccountingStorageEnforce` defaults to `none`) — correct
+for pure history. To later *enforce* fairshare or per-user/account limits on top of the same database,
+add to `slurm.conf` and restart slurmctld:
+
+```ini
+PriorityType=priority/multifactor
+PriorityWeightFairshare=100000
+AccountingStorageEnforce=associations,limits
+```
+
+(If you added the GPU in Step 14 and want GPU-hours tracked, also set
+`AccountingStorageTRES=gres/gpu` — this is the setup that satisfies the "slurmdbd is required for TRES
+gres/gpu" requirement noted in Step 14.)
 
 ---
 
