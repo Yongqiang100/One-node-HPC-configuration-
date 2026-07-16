@@ -24,6 +24,8 @@ tail -f *-*.out        # follow the log
 | `dolfinx-reaktoro.sh` | `dolfinx-reaktoro/2026` | `mpirun` / `srun --mpi=pmi2` | For scripts using BOTH libraries |
 | `phreeqcrm.sh` | `phreeqcrm/3.9.0` + `openmpi/5.0.10` | `srun --mpi=pmix` | Runs YOUR solver that links libPhreeqcRM |
 | `dfnworks.sh` | `dfnworks/2.7` | internal `mpirun` | Activate conda env; use `ncpu=1` in driver.py; don't wrap in srun |
+| `lammps.sh` | `lammps/stable` | `srun --mpi=pmix` | CPU build (~68 pkgs); MPI and/or OpenMP (`-sf kk`) |
+| `lammps-gpu.sh` | `lammps-gpu/stable` | (1 rank/GPU) | GPU build (~69 pkgs, CUDA 13.3); `--gres=gpu:1`; `-sf gpu` or `-sf kk` |
 
 ## The one thing to get right: the MPI launcher
 
@@ -43,6 +45,12 @@ MPI), so your solver owns the MPI (system OpenMPI → `srun --mpi=pmix`) and cal
 *internally* to launch PFLOTRAN — so you do **not** wrap it in `srun`. Two musts: (1) activate the
 conda env in the script (`conda activate /opt/sw/conda/envs/dfnworks`), or `import pydfnworks` fails;
 (2) set `ncpu=1` in `driver.py` for small/moderate networks — the parallel LaGriT merge can hang.
+
+**LAMMPS: two modules, same input files.** `lammps/stable` (CPU) and `lammps-gpu/stable` (GPU) carry
+the same broad package set, so a given input runs under either — only the launch differs. Use the CPU
+template for MPI/OpenMP runs; use the GPU template (with `--gres=gpu:1`) to offload to the RTX 4500.
+The GPU binary also runs CPU-only if you omit the GPU flags. The node has one GPU, so GPU jobs use one
+rank per GPU. Both modules load system Python (not conda), so no conda activation is needed.
 
 ## Things common to every template
 
