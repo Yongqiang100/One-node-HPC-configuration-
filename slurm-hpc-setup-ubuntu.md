@@ -11,7 +11,7 @@ This builds **one workstation** that acts as both the Slurm **controller** and t
 - **NVIDIA GPU support** via Slurm GRES (Step 14)
 - **Remote access for the team** via SSH + VPN (Step 15)
 - Optional: **accounting + fairshare**, **scaling to more nodes**
-- Worked **application examples** — **PFLOTRAN**, **MOOSE**, and **OpenFOAM** (built against your MPI), **DOLFINx + Reaktoro** (shared conda-env modules), **PhreeqcRM** (a C/C++ library to link into your own solver), and **dfnWorks** (discrete fracture networks coupled to PFLOTRAN)
+- Worked **application examples** — **PFLOTRAN**, **MOOSE**, and **OpenFOAM** (built against your MPI), **DOLFINx + Reaktoro** (shared conda-env modules), **PhreeqcRM** (a C/C++ library to link into your own solver), **dfnWorks** (discrete fracture networks coupled to PFLOTRAN), and **LAMMPS** (molecular dynamics, split CPU and GPU/CUDA modules)
 
 It's intentionally laid out so you can add real compute nodes later with minimal changes.
 
@@ -425,6 +425,44 @@ echo 'export PATH=/opt/miniforge3/bin:$PATH' | sudo tee /etc/profile.d/conda.sh
 
 Then each user runs `conda create -n myproj python=3.12 ...` for an isolated environment.
 (Plain `python3 -m venv` works fine too if you'd rather avoid conda.)
+
+### Optional: a `python/3.14` module for *system* Python
+
+Sometimes you specifically need the **system** interpreter (Ubuntu's `/usr` Python 3.14) rather than
+conda — most importantly when *building* software that must link the system `libpython` on the standard
+path instead of conda's (the LAMMPS ML-IAP build is a real example; see the LAMMPS section). A small
+modulefile makes that explicit and selectable:
+
+```bash
+# a shim so bare `python` resolves to system python3 (Ubuntu ships only python3):
+sudo mkdir -p /opt/sw/python-system/3.14/bin
+sudo ln -sf /usr/bin/python3 /opt/sw/python-system/3.14/bin/python
+sudo chmod -R o+rX /opt/sw/python-system
+
+sudo mkdir -p /opt/modulefiles/python
+sudo tee /opt/modulefiles/python/3.14.lua > /dev/null << 'EOF'
+whatis("Name: Python (system) 3.14 — Ubuntu /usr interpreter + dev libraries (non-conda)")
+help([[ System Python 3.14 from /usr (NOT conda). Use for builds that must link the
+system libpython. For CMake: -D Python_EXECUTABLE=/usr/bin/python3.
+NOTE: an ACTIVATED conda env still wins on PATH; run `conda deactivate` first. ]])
+family("python")
+prepend_path("PATH", "/opt/sw/python-system/3.14/bin")   -- bare `python`
+prepend_path("PATH", "/usr/bin")                          -- `python3`
+prepend_path("CPATH", "/usr/include/python3.14")
+prepend_path("LIBRARY_PATH", "/usr/lib/x86_64-linux-gnu")
+prepend_path("LD_LIBRARY_PATH", "/usr/lib/x86_64-linux-gnu")
+prepend_path("PKG_CONFIG_PATH", "/usr/lib/x86_64-linux-gnu/pkgconfig")
+setenv("PYTHON", "/usr/bin/python3")
+setenv("PYTHON_EXECUTABLE", "/usr/bin/python3")
+EOF
+```
+
+Caveat, stated plainly: a modulefile **cannot** override an *activated* conda environment — `conda
+activate` aggressively front-loads its own `bin` on `PATH`, so `python` will still be conda's until you
+`conda deactivate`. The module reliably controls Python only in a clean (non-conda) shell. For the use
+case that actually matters — a build linking the right `libpython` — don't rely on `PATH` at all; pass
+the explicit CMake hint (`-D Python_EXECUTABLE=/usr/bin/python3`) and strip conda from the build's
+`PATH`, as the LAMMPS section does.
 
 ---
 
@@ -1946,6 +1984,158 @@ PFLOTRAN line is the proof dfnWorks is driving the shared `/opt/sw` PFLOTRAN.
 >    env** (`conda activate /opt/sw/conda/envs/dfnworks`) — don't just call the env's python binary, or
 >    `import pydfnworks` fails. And do **not** wrap `python driver.py` in `srun`: dfnWorks calls
 >    `mpirun` internally to launch PFLOTRAN.
+
+---
+
+## Application: LAMMPS (CPU and GPU, split modules)
+
+LAMMPS is installed as **two modules from one source tree**, so users get the same physics on CPU or
+GPU and pick the build that fits the job:
+
+| Module | Prefix | Backends | Packages |
+|---|---|---|---|
+| `lammps/stable` | `/opt/sw/lammps` | MPI + OpenMP (KOKKOS host) | ~68 (`most.cmake`, no GPU) |
+| `lammps-gpu/stable` | `/opt/sw/lammps-gpu` | GPU package + KOKKOS/CUDA, also CPU | ~69 (`most.cmake` + GPU) |
+
+Both carry the broad `most.cmake` package set (REAXFF, MEAM, ML-SNAP/PACE/POD, DPD-*, GRANULAR, SPIN,
+VORONOI, …), link **system Python 3.14** (not conda), and are built against the system OpenMPI
+(`openmpi/5.0.10`) so they launch with `srun --mpi=pmix`.
+
+### The one hard lesson: match CUDA to the toolchain
+
+Ubuntu 26.04 ships **GCC 15 + glibc 2.41**. The CUDA toolkit that was preinstalled (**12.9**) cannot
+compile against this toolchain — you hit, in sequence: `unsupported GNU version` (nvcc caps at GCC 14),
+then C++23 math-header clashes (`cospi`/`sinpi`/`rsqrt` `noexcept` mismatches in glibc 2.41), then
+KOKKOS/GPU-package failures on GCC-15's `type_traits`. Patching these one by one is a losing battle.
+
+**The fix is to install CUDA 13.x** (13.0+ officially supports GCC 15). With CUDA 13.3 the entire GPU
+build compiles with plain GCC 15 — no compiler shim, no header patches. Do not sink time into making
+CUDA 12.9 work here; install 13.x instead.
+
+```bash
+# CUDA 13.x installs alongside 12.x under /usr/local/cuda-13.x (coexist, nothing removed).
+# NVIDIA's repo on Ubuntu 26.04 provides a rolling cuda-toolkit (13.3 at time of writing):
+sudo apt install -y cuda-toolkit-13-3        # or: cuda-toolkit
+ls -d /usr/local/cuda-13*                     # confirm the path
+# sanity — GCC 15, no -ccbin, no patches:
+echo 'int main(){return 0;}' > /tmp/t.cu
+/usr/local/cuda-13.3/bin/nvcc /tmp/t.cu -o /tmp/t && echo OK    # must print OK
+```
+
+### CPU build (`lammps/stable`)
+
+No CUDA, so no GCC-15/CUDA friction — KOKKOS with OpenMP only, plain GCC 15. Build under Slurm to get
+uncapped cores (interactive CPU is capped per user). The key non-obvious flags are the **system-Python
+pinning** (see the conda note below).
+
+```bash
+git clone -b stable https://github.com/lammps/lammps.git /opt/sw/lammps/src   # once, shared
+# build-cpu-full.sh (submitted with sbatch --cpus-per-task=24):
+module load openmpi/5.0.10
+export PATH=$(echo "$PATH" | tr ':' '\n' | grep -v miniforge | paste -sd:)   # strip conda! (see below)
+export PATH=/usr/bin:$PATH
+cd /opt/sw/lammps && rm -rf build-cpu-full && mkdir build-cpu-full && cd build-cpu-full
+cmake ../src/cmake \
+  -C ../src/cmake/presets/most.cmake \
+  -D CMAKE_INSTALL_PREFIX=/opt/sw/lammps \
+  -D BUILD_MPI=yes -D BUILD_OMP=yes -D CMAKE_CXX_COMPILER=mpicxx \
+  -D CMAKE_BUILD_TYPE=Release -D CMAKE_CXX_STANDARD=20 \
+  -D PKG_KOKKOS=yes -D Kokkos_ARCH_NATIVE=yes -D Kokkos_ENABLE_OPENMP=yes \
+  -D FFT=FFTW3 -D PKG_PYTHON=no \
+  -D Python_EXECUTABLE=/usr/bin/python3 -D Python3_EXECUTABLE=/usr/bin/python3 \
+  -D Python_ROOT_DIR=/usr -D Python3_ROOT_DIR=/usr -D Python_FIND_STRATEGY=LOCATION \
+  -D PKG_ML-PACE=yes -D DOWNLOAD_PACE=yes -D PKG_MDI=yes -D DOWNLOAD_MDI=yes
+make -j24 && make install
+```
+
+### GPU build (`lammps-gpu/stable`)
+
+Same as above **plus** the CUDA/GPU flags, pointed at **CUDA 13.3**. The GPU is an RTX 4500 Ada →
+compute 8.9 → `Kokkos_ARCH_ADA89` and `GPU_ARCH=sm_89`. voro++ (`sudo apt install voro++ voro++-dev`)
+provides VORONOI. Build under Slurm (uncapped; ~13 min at `-j24`):
+
+```bash
+module load openmpi/5.0.10
+export CUDA_HOME=/usr/local/cuda-13.3
+export PATH=$(echo "$PATH" | tr ':' '\n' | grep -v miniforge | paste -sd:)
+export PATH=/usr/local/cuda-13.3/bin:/usr/bin:$PATH
+cd /opt/sw/lammps && rm -rf build-gpu-full && mkdir build-gpu-full && cd build-gpu-full
+cmake ../src/cmake \
+  -C ../src/cmake/presets/most.cmake \
+  -D CMAKE_INSTALL_PREFIX=/opt/sw/lammps-gpu \
+  -D BUILD_MPI=yes -D BUILD_OMP=yes -D CMAKE_CXX_COMPILER=mpicxx \
+  -D CMAKE_BUILD_TYPE=Release -D CMAKE_CXX_STANDARD=20 \
+  -D CUDAToolkit_ROOT=/usr/local/cuda-13.3 \
+  -D PKG_KOKKOS=yes -D Kokkos_ARCH_NATIVE=yes -D Kokkos_ARCH_ADA89=yes \
+  -D Kokkos_ENABLE_CUDA=yes -D Kokkos_ENABLE_OPENMP=yes -D FFT_KOKKOS=CUFFT \
+  -D PKG_GPU=yes -D GPU_API=cuda -D GPU_ARCH=sm_89 -D GPU_PREC=mixed \
+  -D FFT=FFTW3 -D PKG_PYTHON=no \
+  -D Python_EXECUTABLE=/usr/bin/python3 -D Python3_EXECUTABLE=/usr/bin/python3 \
+  -D Python_ROOT_DIR=/usr -D Python3_ROOT_DIR=/usr -D Python_FIND_STRATEGY=LOCATION \
+  -D PKG_ML-PACE=yes -D DOWNLOAD_PACE=yes -D PKG_MDI=yes -D DOWNLOAD_MDI=yes
+make -j24 && make install
+```
+
+> **The conda-Python trap.** `most.cmake` includes ML-IAP, which links **libpython** even with
+> `PKG_PYTHON=no`. CMake's `find_package(Python …)` will grab **conda's** Python (`/opt/miniforge3`,
+> 3.13) if conda is on `PATH` — producing a binary that fails to start with
+> `libpython3.13.so.1.0: cannot open shared object file` unless conda happens to be loaded. The fix is
+> two-fold and both parts matter: (1) **strip miniforge from `PATH`** inside the build (the `grep -v
+> miniforge` line), so CMake can only find system Python; (2) pin `Python*_EXECUTABLE=/usr/bin/python3`
+> and `Python_ROOT_DIR=/usr`. Then the binary links `/usr/lib/x86_64-linux-gnu/libpython3.14.so.1.0`
+> (system, standard path) and has **no conda dependency**. Verify with
+> `ldd /opt/sw/lammps-gpu/bin/lmp | grep -iE 'not found|python'` — it must show the `/usr/lib` path and
+> no "not found". This is easy to miss because the CMake cache will show `PKG_PYTHON=no` while the log
+> quietly reports `Found Python: /opt/miniforge3/...` for the Development component.
+
+### Modulefiles
+
+```bash
+# CPU
+sudo mkdir -p /opt/modulefiles/lammps
+sudo tee /opt/modulefiles/lammps/stable.lua > /dev/null << 'EOF'
+whatis("Name: LAMMPS (stable) — MD, CPU (MPI + OpenMP), broad package set (68 pkgs)")
+depends_on("openmpi/5.0.10")
+prepend_path("PATH", "/opt/sw/lammps/bin")
+prepend_path("LD_LIBRARY_PATH", "/opt/sw/lammps/lib")
+prepend_path("LD_LIBRARY_PATH", "/opt/sw/lammps/lib64")
+EOF
+
+# GPU
+sudo mkdir -p /opt/modulefiles/lammps-gpu
+sudo tee /opt/modulefiles/lammps-gpu/stable.lua > /dev/null << 'EOF'
+whatis("Name: LAMMPS-GPU (stable) — MD on RTX 4500 Ada (CUDA 13.3), broad set (69 pkgs)")
+depends_on("openmpi/5.0.10")
+prepend_path("PATH", "/opt/sw/lammps-gpu/bin")
+prepend_path("LD_LIBRARY_PATH", "/opt/sw/lammps-gpu/lib")
+prepend_path("LD_LIBRARY_PATH", "/opt/sw/lammps-gpu/lib64")
+prepend_path("LD_LIBRARY_PATH", "/usr/local/cuda-13.3/lib64")
+setenv("CUDA_HOME", "/usr/local/cuda-13.3")
+EOF
+chmod -R o+rX /opt/sw/lammps /opt/sw/lammps-gpu
+```
+
+### Verify
+
+```bash
+module load lammps-gpu/stable
+ldd $(which lmp) | grep -i 'not found'                 # must be EMPTY
+lmp -h 2>&1 | grep -iE 'Compatible GPU|Installed pack' # GPU: yes; then the package list
+cd ~/runs && cp /opt/sw/lammps/src/bench/in.lj .
+lmp -sf gpu -pk gpu 1 -in in.lj                        # prints "Device 0: NVIDIA RTX 4500 Ada …"
+lmp -k on g 1 -sf kk  -in in.lj                        # KOKKOS/CUDA path
+mpirun -np 8 lmp -in in.lj                             # CPU path (same binary)
+```
+
+A successful GPU run prints a `Device 0: NVIDIA RTX 4500 Ada Generation …` block — that's the proof it
+executed on the card. See `lammps.sh` / `lammps-gpu.sh` in the Slurm templates for batch usage
+(GPU jobs use `--gres=gpu:1`, one rank per GPU).
+
+> **Build under Slurm, not interactively.** These are large builds (69 packages + CUDA). Interactive
+> CPU is capped per user, so a foreground `make` crawls; submitting the build as a Slurm job gets all
+> requested cores **and** is immune to SSH disconnects. The same goes for the auto-download packages
+> (`DOWNLOAD_PACE`, `DOWNLOAD_MDI`) which fetch from GitHub during the build — the build network
+> allowlist already permits github.com.
 
 ---
 
