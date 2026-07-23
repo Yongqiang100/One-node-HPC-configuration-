@@ -11,7 +11,7 @@ This builds **one workstation** that acts as both the Slurm **controller** and t
 - **NVIDIA GPU support** via Slurm GRES (Step 14)
 - **Remote access for the team** via SSH + VPN (Step 15)
 - Optional: **accounting + fairshare**, **scaling to more nodes**
-- Worked **application examples** — **PFLOTRAN**, **MOOSE**, and **OpenFOAM** (built against your MPI), **DOLFINx + Reaktoro** (shared conda-env modules), **PhreeqcRM** (a C/C++ library to link into your own solver), **dfnWorks** (discrete fracture networks coupled to PFLOTRAN), and **LAMMPS** (molecular dynamics, split CPU and GPU/CUDA modules)
+- Worked **application examples** — **PFLOTRAN**, **MOOSE**, and **OpenFOAM** (built against your MPI), **DOLFINx + Reaktoro** (shared conda-env modules), **PhreeqcRM** (a C/C++ library to link into your own solver), **dfnWorks** (discrete fracture networks coupled to PFLOTRAN), **LAMMPS** (molecular dynamics, split CPU and GPU/CUDA modules), and **LBPM** (lattice-Boltzmann porous-media flow, GPU/CUDA — needs a CUDA-aware MPI)
 
 It's intentionally laid out so you can add real compute nodes later with minimal changes.
 
@@ -2136,6 +2136,136 @@ executed on the card. See `lammps.sh` / `lammps-gpu.sh` in the Slurm templates f
 > requested cores **and** is immune to SSH disconnects. The same goes for the auto-download packages
 > (`DOWNLOAD_PACE`, `DOWNLOAD_MDI`) which fetch from GitHub during the build — the build network
 > allowlist already permits github.com.
+
+---
+
+## CUDA-aware OpenMPI (`openmpi-cuda/5.0.10`) — for GPU codes that MPI on device buffers
+
+The default `openmpi/5.0.10` (both the Spack build and the apt one) is **not CUDA-aware** — built
+`--without-cuda --without-ucx`. That's fine for CPU codes, but GPU codes that hand `cudaMalloc`'d
+device pointers directly to `MPI_Isend/Irecv` (LBPM's ScaLBL halo exchange is the example) **segfault
+instantly** on it — the MPI can't touch device memory, and no runtime env var fixes a capability that
+wasn't compiled in. For those codes you need a second, CUDA-aware MPI. Build it with Spack:
+
+```bash
+# register the system CUDA 13.3 as a Spack external first (so +cuda doesn't build CUDA):
+spack external find --not-buildable cuda
+# pin the explicit path in ~/.spack/packages.yaml (avoids the /usr/local/cuda alternatives symlink):
+#   cuda:
+#     externals: [ { spec: cuda@13.3.73, prefix: /usr/local/cuda-13.3 } ]
+#     buildable: false
+
+# build CUDA-aware OpenMPI + UCX (device-buffer transports), arch sm_89:
+spack install --reuse \
+  openmpi@5.0.10 +cuda +internal-pmix fabrics=ucx cuda_arch=89 \
+  ^ucx +cuda +cma cuda_arch=89 \
+  ^cuda@13.3.73
+```
+
+This coexists with the non-CUDA `openmpi@5.0.10` (different Spack hash). Give it a **distinct module**
+so the two never collide — the CUDA one `conflict`s with the plain one, so only one is ever on `PATH`:
+
+```bash
+CUDA_MPI=$(spack location -i openmpi +cuda)
+UCX_CUDA=$(spack location -i ucx +cuda)
+sudo mkdir -p /opt/modulefiles/openmpi-cuda
+sudo tee /opt/modulefiles/openmpi-cuda/5.0.10.lua > /dev/null << EOF
+whatis("Name: OpenMPI 5.0.10 (CUDA-aware) — +cuda +ucx, for GPU codes doing MPI on device buffers")
+family("mpi")
+conflict("openmpi")
+prepend_path("PATH", "$CUDA_MPI/bin")
+prepend_path("LD_LIBRARY_PATH", "$CUDA_MPI/lib")
+prepend_path("LD_LIBRARY_PATH", "$UCX_CUDA/lib")
+prepend_path("LD_LIBRARY_PATH", "/usr/local/cuda-13.3/lib64")
+setenv("MPICC", "$CUDA_MPI/bin/mpicc")
+setenv("MPICXX", "$CUDA_MPI/bin/mpicxx")
+EOF
+```
+
+Verify it's genuinely CUDA-aware (the check the old MPI fails):
+
+```bash
+module load openmpi-cuda/5.0.10
+ompi_info | grep -iE 'MCA accelerator: cuda|MPI extensions'   # shows cuda accelerator + extension
+ucx_info -d | grep -iE 'cuda_copy|cuda_ipc'                    # device-buffer transports present
+```
+
+`MCA accelerator: cuda` + UCX `cuda_copy`/`cuda_ipc` = it can carry device pointers. This module is a
+reusable building block for **any** future GPU-MPI code, not just LBPM.
+
+---
+
+## Application: LBPM (lattice-Boltzmann porous media, GPU/CUDA)
+
+LBPM does two-phase flow in porous media on the GPU. It's the reason the CUDA-aware MPI above exists —
+ScaLBL's halo exchange passes device pointers straight to MPI.
+
+**Build against the CUDA-aware MPI**, with CUDA 13.3 / sm_89, serial HDF5, into `/opt/sw/lbpm`:
+
+```bash
+git clone https://github.com/OPM/LBPM.git /opt/sw/lbpm/src
+sudo apt install -y libhdf5-dev        # serial HDF5 (/usr/.../hdf5/serial)
+
+# build as a Slurm job (uncapped, disconnect-proof):
+module load openmpi-cuda/5.0.10
+export CUDA_HOME=/usr/local/cuda-13.3 PATH=$CUDA_HOME/bin:$PATH
+cd /opt/sw/lbpm && rm -rf build && mkdir build && cd build
+cmake \
+  -D CMAKE_INSTALL_PREFIX=/opt/sw/lbpm \
+  -D CMAKE_BUILD_TYPE=Release \
+  -D CMAKE_C_COMPILER=mpicc -D CMAKE_CXX_COMPILER=mpicxx \
+  -D CMAKE_C_FLAGS="-fPIC" -D CMAKE_CXX_FLAGS="-fPIC" -D CMAKE_CXX_STANDARD=17 \
+  -D USE_MPI=1 -D MPIEXEC=mpirun \
+  -D USE_CUDA=1 -D CMAKE_CUDA_COMPILER=$CUDA_HOME/bin/nvcc \
+  -D CMAKE_CUDA_ARCHITECTURES=89 -D CMAKE_CUDA_HOST_COMPILER=$(which g++) \
+  -D USE_HDF5=1 -D HDF5_DIRECTORY=/usr/lib/x86_64-linux-gnu/hdf5/serial \
+  -D HDF5_ROOT=/usr/lib/x86_64-linux-gnu/hdf5/serial \
+  -D USE_SILO=0 -D USE_NETCDF=0 -D USE_TIMER=0 \
+  ../src
+make -j16 && make install
+```
+
+> **The one GCC-15 source fix.** LBPM's `common/Units.h` declares `enum class ... : int8_t/uint8_t`
+> but doesn't `#include <cstdint>` — older libstdc++ leaked it in transitively; GCC 15 doesn't. Result:
+> a flood of `'UnitValue' has not been declared` / `'d_unit' was not declared` errors. Fix is one line:
+> `sed -i 's|#include <array>|#include <cstdint>\n#include <array>|' /opt/sw/lbpm/src/common/Units.h`.
+> (Same class of GCC-15 breakage as LaGriT — a missing `<cstdint>`.) Nothing else needed patching.
+
+**Module** (depends on the CUDA-aware MPI):
+
+```bash
+sudo ln -sfn /opt/sw/lbpm/build/bin /opt/sw/lbpm/bin      # binaries land in build/bin
+sudo mkdir -p /opt/modulefiles/lbpm
+sudo tee /opt/modulefiles/lbpm/1.0.lua > /dev/null << 'EOF'
+whatis("Name: LBPM 1.0 — Lattice-Boltzmann porous media (GPU/CUDA)")
+depends_on("openmpi-cuda/5.0.10")
+prepend_path("PATH", "/opt/sw/lbpm/bin")
+prepend_path("LD_LIBRARY_PATH", "/usr/local/cuda-13.3/lib64")
+setenv("LBPM_BIN", "/opt/sw/lbpm/bin")
+setenv("PMIX_MCA_psec", "native")
+EOF
+chmod -R o+rX /opt/sw/lbpm
+```
+
+**Run** — geometry first, then the simulator. A deck needs a `Domain{ Filename=... n=... ReadType=...
+ReadValues=... }` block pointing at a segmented `.raw` volume (generate with a script, e.g. the
+`CreateBubble.py` in `example/Bubble`), and the deck's `nproc` product must equal the MPI rank count.
+Single-rank GPU can run the binary directly (no launcher). A successful run prints a `Lattice update
+rate (… MLUPS)` line — that means the timestep loop (and the device-pointer halo exchange) completed.
+
+```bash
+module load lbpm/1.0
+cd ~/runs/mycase                       # dir with input.db + geometry.raw
+lbpm_color_simulator input.db          # single rank on the GPU
+# multi-rank (shares the one GPU; nproc in deck must match):
+# srun --mpi=pmix -n 4 lbpm_color_simulator input.db
+```
+
+See the `lbpm.sh` Slurm template for batch usage (`--gres=gpu:1`).
+
+> **GPU memory bounds the domain.** The RTX 4500 Ada has 24 GB — a 750³ lattice does not fit regardless
+> of rank count (multi-rank on one GPU shares, not adds, memory). Develop/validate on ≤256³ crops;
+> large domains need multi-GPU hardware (and then the CUDA-aware MPI is doing real inter-GPU transport).
 
 ---
 
