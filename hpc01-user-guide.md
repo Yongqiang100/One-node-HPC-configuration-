@@ -18,7 +18,8 @@ your account is unprivileged by design, and almost everything you need is alread
 
 Because it's one shared node, you submit jobs to a **queue** rather than just running heavy work
 directly — Slurm makes sure two big jobs don't fight over the same cores. Small interactive tests are
-fine to run directly; anything long or parallel should go through Slurm (§5).
+fine to run directly (interactive CPU is capped per user, §7); anything long or parallel should go
+through Slurm (§5). GPU work (LAMMPS-GPU, LBPM) also goes through Slurm with a GPU request (§6).
 
 ---
 
@@ -61,8 +62,15 @@ The applications most likely relevant to the group:
 | `dolfinx/2026` | FEniCSx finite elements (Python) | `python …` (MPI) |
 | `reaktoro/2026` | Chemical reaction modeling (Python) | `python …` (serial) |
 | `dolfinx-reaktoro/2026` | Combined env for scripts needing **both** | `python …` (MPI) |
+| `phreeqcrm/3.9.0` | PhreeqcRM reaction library (link into your own solver) | (your executable, MPI) |
+| `dfnworks/2.7` | Discrete fracture networks → PFLOTRAN | `python driver.py` (see notes) |
+| `lammps/stable` | Molecular dynamics — **CPU** (MPI + OpenMP) | `lmp` (MPI / `-sf kk`) |
+| `lammps-gpu/stable` | Molecular dynamics — **GPU** (CUDA) | `lmp -sf gpu …` (**GPU**) |
+| `lbpm/1.0` | Lattice-Boltzmann porous-media flow — **GPU** | `lbpm_color_simulator` (**GPU**) |
+| `python/3.14` | System Python 3.14 (non-conda), for builds/tools | `python3` |
 
-Load one with:
+Modules marked **GPU** need a GPU allocation when run through Slurm (`--gres=gpu:1`, see §6). Load one
+with:
 
 ```bash
 module load openfoam/v2506
@@ -81,6 +89,15 @@ A few things worth knowing:
 others — you'll see a message like *"Lmod is automatically replacing …"*. That's expected. If your
 script needs to `import dolfinx` **and** `import reaktoro` in the same program, use the combined
 `dolfinx-reaktoro/2026` module, not the two separate ones.
+
+**LAMMPS comes in two flavors.** `lammps/stable` (CPU) and `lammps-gpu/stable` (GPU) have the same
+physics packages and read the same input files — load `lammps/stable` for CPU (MPI/OpenMP) runs, or
+`lammps-gpu/stable` to use the GPU. Don't load both at once.
+
+**LBPM needs its own MPI.** `lbpm/1.0` automatically loads a special **CUDA-aware** MPI
+(`openmpi-cuda/5.0.10`) instead of the normal one, because its GPU code sends data between the GPU and
+MPI directly. You don't have to do anything — loading `lbpm/1.0` handles it — but note it will unload a
+normal `openmpi` module if you had one loaded (they conflict by design).
 
 **Module commands need a login shell.** They work normally when you SSH in. Inside a Slurm batch
 script (which doesn't get a login shell by default), the script provided in §5 already handles this.
@@ -156,11 +173,13 @@ scancel <jobid>                          # cancel a job if needed
 
 Two of the toolchains use **different MPI under the hood**, so they need different `srun` flags:
 
-- **PFLOTRAN, MOOSE, OpenFOAM** — built against the system OpenMPI. Use **`srun --mpi=pmix`**
-  (or interactively, `mpirun -n N …`).
+- **PFLOTRAN, MOOSE, OpenFOAM, LAMMPS, PhreeqcRM** — built against the system OpenMPI. Use
+  **`srun --mpi=pmix`** (or interactively, `mpirun -n N …`).
 - **DOLFINx / Reaktoro / combined** (the conda Python envs) — use the environment's own
   **`mpirun -n N python …`**, or under Slurm **`srun --mpi=pmi2`**. Do **not** use `--mpi=pmix` for
   these; it will fail.
+- **LBPM** uses the CUDA-aware MPI (loaded automatically by its module). For a single GPU rank you can
+  run the binary directly (no launcher); for multi-rank use `srun --mpi=pmix`.
 
 If a parallel job errors immediately with an MPI/PMI message, the launcher flag is the first thing to
 check.
@@ -174,7 +193,83 @@ shared, so don't grab all 48 cores for a job that doesn't need them.
 
 ---
 
-## 6. Quick interactive test (small only)
+## 6. GPU jobs
+
+The node has **one** NVIDIA RTX 4500 Ada GPU (24 GB). To use it, two modules are GPU-enabled:
+`lammps-gpu/stable` and `lbpm/1.0`. A GPU job must **request the GPU** from Slurm with `--gres=gpu:1` —
+without it, your job won't have access to the card even though the module is loaded.
+
+A GPU batch script looks like a normal one plus the `--gres` line:
+
+```bash
+#!/bin/bash
+#SBATCH --job-name=gpujob
+#SBATCH --partition=normal
+#SBATCH --gres=gpu:1              # <-- request the GPU (required)
+#SBATCH --ntasks=1               # one rank per GPU is typical
+#SBATCH --cpus-per-task=8        # CPU cores for host-side work
+#SBATCH --time=04:00:00
+#SBATCH --output=%x-%j.out
+
+source /etc/profile.d/z99-local-modules.sh 2>/dev/null || true
+module purge
+module load lammps-gpu/stable            # or: lbpm/1.0
+
+cd "$SLURM_SUBMIT_DIR"
+
+# LAMMPS on GPU:
+lmp -sf gpu -pk gpu 1 -in in.lj
+# LBPM on GPU (single rank, run directly):
+# lbpm_color_simulator input.db
+```
+
+A few GPU-specific things:
+
+**One GPU means one GPU job at a time.** If someone else's GPU job is running, yours waits in the queue
+(`PD`) until the card is free — the same sharing logic as cores, but there's only one GPU. `squeue`
+shows what's using it.
+
+**The GPU has 24 GB.** That bounds your problem size — a domain/system that needs more than ~24 GB of
+device memory won't fit, and (for a single node) more MPI ranks share that memory rather than adding to
+it. Develop and validate at a size that fits.
+
+**Ready-made GPU templates** for LAMMPS and LBPM are in the Slurm-templates collection (`lammps-gpu.sh`,
+`lbpm.sh`) — copy those rather than writing from scratch.
+
+---
+
+## 7. Interactive work is CPU-limited (by design)
+
+You can run small things directly on the login shell (a quick test, a short pre/post-processing
+script), but **interactive CPU is capped per user** — you get a limited slice of cores when running
+outside Slurm. This is deliberate: it keeps one person's interactive work from starving everyone else's
+queued jobs. If an interactive command feels slow or seems limited to a few cores, that's the cap, not
+a problem with the machine.
+
+The rule of thumb: **anything that needs real compute goes through `sbatch`**, where it gets full,
+unthrottled resources. Interactive is for quick checks and setup, not production runs. (This is also why
+a big interactive build or job crawls while the same work submitted to Slurm runs fast.)
+
+---
+
+## 8. Job history
+
+Slurm records every job you run, so you can look back at what happened — useful for checking runtimes,
+memory use, or whether an old job succeeded:
+
+```bash
+sacct -X --starttime today                                    # your jobs today
+sacct -X -S 2026-06-01 --format=JobID,JobName,State,Elapsed,MaxRSS
+sacct -j <jobid> --format=JobID,JobName,State,Elapsed,MaxRSS  # one job, with memory used
+```
+
+`MaxRSS` (peak memory) is handy for right-sizing future jobs. Note that **only Slurm jobs are recorded**
+— interactive work on the login shell doesn't appear, which is another reason to run real work through
+`sbatch`.
+
+---
+
+## 9. Quick interactive test (small only)
 
 For a quick check you can run directly without a batch script — but keep it small and short, since it
 competes with queued jobs:
@@ -191,12 +286,12 @@ For MOOSE/PFLOTRAN/OpenFOAM interactively:
 module load openfoam/v2506
 cd ~/runs/cavity/cavity
 blockMesh
-icoFoam                                  # serial; parallel needs decomposePar first (see §7)
+icoFoam                                  # serial; parallel needs decomposePar first (see §10)
 ```
 
 ---
 
-## 7. OpenFOAM parallel runs (a note)
+## 10. OpenFOAM parallel runs (a note)
 
 OpenFOAM splits a mesh across ranks with `decomposePar` before a parallel run, then merges results
 with `reconstructPar` after. The number of subdomains must match your rank count. The simplest
@@ -219,7 +314,7 @@ doesn't match the method — using `method scotch;` as above avoids that.
 
 ---
 
-## 8. Etiquette & good habits
+## 11. Etiquette & good habits
 
 - **Run from your own directory**, not `/opt/sw` (§4).
 - **Use the queue for heavy work** — submit with `sbatch` rather than running long jobs on the login
@@ -235,7 +330,7 @@ doesn't match the method — using `method scotch;` as above avoids that.
 
 ---
 
-## 9. Common problems
+## 12. Common problems
 
 | Symptom | Likely cause / fix |
 |---|---|
@@ -245,6 +340,9 @@ doesn't match the method — using `method scotch;` as above avoids that.
 | `import dolfinx` and `import reaktoro` can't both load | Load the combined `dolfinx-reaktoro/2026` module, not the two separate ones. |
 | Module not found right after it was added | Cache is stale: `module --ignore_cache avail`, or ask thmc. |
 | Job stuck in `PD` (pending) | Another job is using the cores. `squeue` shows who; yours runs when the node frees up. |
+| GPU job can't see the GPU / CUDA errors | You forgot `--gres=gpu:1` in the batch script, or another GPU job is running. Add the flag; check `squeue`. |
+| Interactive command seems capped to a few cores | Expected — interactive CPU is limited per user (§7). Run real work via `sbatch` for full resources. |
+| `lbpm` won't load alongside a normal `openmpi` | By design — LBPM needs the CUDA-aware MPI, which conflicts with the plain one. `module purge` first, then `module load lbpm/1.0`. |
 | Need software that isn't installed | Ask thmc — don't try to install system-wide yourself. |
 
 ---
