@@ -26,6 +26,7 @@ tail -f *-*.out        # follow the log
 | `dfnworks.sh` | `dfnworks/2.7` | internal `mpirun` | Activate conda env; use `ncpu=1` in driver.py; don't wrap in srun |
 | `lammps.sh` | `lammps/stable` | `srun --mpi=pmix` | CPU build (~68 pkgs); MPI and/or OpenMP (`-sf kk`) |
 | `lammps-gpu.sh` | `lammps-gpu/stable` | (1 rank/GPU) | GPU build (~69 pkgs, CUDA 13.3); `--gres=gpu:1`; `-sf gpu` or `-sf kk` |
+| `lbpm.sh` | `lbpm/1.0` | direct / `srun --mpi=pmix` | Lattice-Boltzmann, GPU/CUDA; `--gres=gpu:1`; needs CUDA-aware MPI + geometry `.raw` |
 
 ## The one thing to get right: the MPI launcher
 
@@ -51,6 +52,13 @@ the same broad package set, so a given input runs under either — only the laun
 template for MPI/OpenMP runs; use the GPU template (with `--gres=gpu:1`) to offload to the RTX 4500.
 The GPU binary also runs CPU-only if you omit the GPU flags. The node has one GPU, so GPU jobs use one
 rank per GPU. Both modules load system Python (not conda), so no conda activation is needed.
+
+**LBPM needs the CUDA-aware MPI.** `lbpm/1.0` depends on `openmpi-cuda/5.0.10` (not the plain
+`openmpi/5.0.10`), because its GPU halo exchange passes device pointers through MPI — the plain MPI
+segfaults on that. The module handles this automatically. Two run notes: (1) generate the segmented
+geometry `.raw` and reference it in the deck's `Domain{ Filename=... }` before submitting; (2) the
+deck's `Domain{ nproc }` product must equal `--ntasks`. Single-rank GPU can run the binary directly
+(no launcher). A `Lattice update rate (… MLUPS)` line in the output means the timestep loop ran.
 
 ## Things common to every template
 
